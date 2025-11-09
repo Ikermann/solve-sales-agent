@@ -1,0 +1,531 @@
+import React, { useState, useEffect, useRef } from 'react';
+
+// Environment variables and configuration
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+const hasApiKey = !!apiKey;
+
+// --- Constants ---
+const COACH_ROLE_NAME = "Sales Coach";
+
+// --- SOLVE Core Structure (Used in config screen and progress panel) ---
+const SOLVE_STEPS_DATA = [
+    { key: 'S', label: 'Spot the Pain', long: 'Identify and confirm a specific, quantifiable pain point. (e.g., "So, that waste of time costs you about $3,000 a month, correct?")' },
+    { key: 'O', label: 'Outline Outcome', long: 'Clearly state the guaranteed, quantifiable positive result. (e.g., "We guarantee you\'ll save 15 hours a week, freeing you up for $5k in new client revenue.")' },
+    { key: 'L', label: 'Limit Risk', long: 'Present a strong, risk-free guarantee or condition (e.g., money-back, pay-on-performance, or clear SLA).' },
+    { key: 'V', label: 'Value Pack', long: 'Create urgency or add extra value. (e.g., "The first 10 clients this month get the advanced setup training free, but spots close Friday.")' },
+    { key: 'E', label: 'Execute CTA', long: 'Ask for a clear, definitive next step. (e.g., "Does it make sense to book a 15-minute onboarding call right now?")' },
+];
+
+// --- Simplified Initial Prompt (Used in the first chat message) ---
+const COACH_GUIDE_TEXT = `
+## Welcome to the SOLVE Confidence Challenge!
+
+**Your goal:** Guide the prospect through the 5-step SOLVE framework using conversational, objection-handling language. Your progress is tracked in the panel on the right. To review the framework steps, click the "What is SOLVE?" button on the Start Roleplay screen.
+`;
+
+// --- Firebase Dummy Setup (Mandatory Standard) ---
+let auth = null;
+let db = null;
+const dummyUserId = crypto.randomUUID(); 
+
+// --- JSON Response Schema Definition ---
+const RESPONSE_SCHEMA = {
+    type: "OBJECT",
+    properties: {
+        response_text: {
+            type: "STRING",
+            description: "The prospect's chat message, including any objections or questions."
+        },
+        solve_status: {
+            type: "OBJECT",
+            description: "A boolean map showing which steps of the SOLVE framework the user has successfully completed in the conversation so far.",
+            properties: {
+                "S": { type: "BOOLEAN", description: "Spot the Pain Point: True if the user has confirmed a specific, quantifiable pain point." },
+                "O": { type: "BOOLEAN", description: "Outline a Specific Outcome: True if the user has clearly stated the quantifiable, positive result." },
+                "L": { type: "BOOLEAN", description: "Limit Risk with Guarantees: True if the user has presented a strong, risk-free guarantee." },
+                "V": { type: "BOOLEAN", description: "Value Pack with Urgency: True if the user has added extra value or created a time-sensitive incentive." },
+                "E": { type: "BOOLEAN", description: "Execute with a Clear Call to Action: True if the user has explicitly requested the next step." }
+            },
+            propertyOrdering: ["S", "O", "L", "V", "E"]
+        }
+    },
+    propertyOrdering: ["response_text", "solve_status"]
+};
+
+/**
+ * Handles API calls to the Prospect agent with model fallback and improved error handling.
+ */
+const callClaude = async (history, systemInstruction, isFinalCall = false) => {
+    const apiKey = import.meta.env.VITE_CLAUDE_API_KEY;
+    if (!apiKey) {
+        throw new Error('Claude API key is not configured. Please set VITE_CLAUDE_API_KEY in your .env file.');
+    }
+
+    const model = 'claude-3-opus-20240229'; // or 'claude-3-sonnet-20240229' for lower cost
+    const maxRetries = 3;
+    const baseDelay = 1000;
+    let lastError = null;
+
+    const apiUrl = 'https://api.anthropic.com/v1/messages';
+    
+    console.log('Preparing Claude API request:', {
+        model,
+        historyLength: history.length,
+        isFinalCall
+    });
+
+    // Convert history to Claude's message format
+    const messages = history.map(msg => ({
+        role: msg.role === 'user' ? 'user' : 'assistant',
+        content: msg.parts[0].text
+    }));
+
+    // Add system instruction if present
+    if (systemInstruction) {
+        messages.unshift({
+            role: 'system',
+            content: systemInstruction
+        });
+    }
+
+    const payload = {
+        model,
+        messages,
+        max_tokens: 1024,
+        temperature: 0.7,
+        system: "You are a sales coach helping with the SOLVE framework. Your responses should be in JSON format matching the specified schema."
+    };
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'x-api-key': apiKey,
+                        'anthropic-version': '2023-06-01'
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                // Handle rate limiting (429)
+                if (response.status === 429) {
+                    const retryAfter = response.headers.get('Retry-After');
+                    const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : baseDelay * Math.pow(2, attempt);
+                    console.warn(`Rate limit reached (attempt ${attempt + 1}/${maxRetries}), waiting ${waitTime/1000} seconds...`);
+                    await new Promise(resolve => setTimeout(resolve, waitTime));
+                    continue;
+                }
+
+                // Handle overloaded model (503)
+                if (response.status === 503) {
+                    console.warn(`Model ${model} is overloaded, will try another model if available`);
+                    break; // Break the retry loop to try next model
+                }
+
+                if (response.ok) {
+                    const responseText = await response.text();
+                    let result;
+                    try {
+                        result = JSON.parse(responseText);
+                        console.log('API Response received:', {
+                            model,
+                            status: response.status,
+                            hasContent: !!result.candidates?.[0]?.content,
+                            timestamp: new Date().toISOString()
+                        });
+                    } catch (e) {
+                        console.error("JSON parsing error:", {
+                            error: e.name,
+                            message: e.message,
+                            rawResponse: responseText.substring(0, 500) + (responseText.length > 500 ? '...' : ''),
+                            timestamp: new Date().toISOString()
+                        });
+                        throw new Error(`Failed to parse API response: ${e.message}`);
+                    }
+
+                    const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                    if (!jsonText) {
+                        console.error('Empty response from model:', {
+                            model,
+                            hasResult: !!result,
+                            hasCandidates: !!result?.candidates,
+                            candidatesLength: result?.candidates?.length
+                        });
+                        continue; // Try next attempt or model
+                    }
+
+                    if (isFinalCall) {
+                        return { text: jsonText, status: { S: true, O: true, L: true, V: true, E: true } };
+                    }
+
+                    try {
+                        const cleanedJsonText = jsonText.replace(/```json\n?|```/g, '').trim();
+                        console.log('Cleaned JSON text:', cleanedJsonText);
+                        
+                        const parsed = JSON.parse(cleanedJsonText);
+                        const status = {
+                            S: !!parsed.solve_status?.s_spotted_pain_point,
+                            O: !!parsed.solve_status?.o_outlined_specific_outcome,
+                            L: !!parsed.solve_status?.l_limited_risk_with_guarantees,
+                            V: !!parsed.solve_status?.v_value_packed_with_urgency,
+                            E: !!parsed.solve_status?.e_executed_with_cta,
+                        };
+                        const responseText = parsed.persona_response || parsed.response_text;
+                        return { text: responseText, status: status };
+                    } catch (e) {
+                        console.error("JSON parsing error:", {
+                            error: e.name,
+                            message: e.message,
+                            rawText: jsonText.substring(0, 200) + '...',
+                            model
+                        });
+                        if (attempt === maxRetries - 1) {
+                            lastError = new Error("Could not parse the AI response after multiple attempts.");
+                            break; // Try next model
+                        }
+                    }
+                } else {
+                    const errorBody = await response.text();
+                    console.error('API Error Response:', {
+                        model,
+                        status: response.status,
+                        body: errorBody,
+                        attempt: attempt + 1,
+                        maxRetries
+                    });
+                    
+                    if (response.status === 503) {
+                        break; // Try next model immediately
+                    }
+                    
+                    lastError = new Error(`API Error (${response.status}): ${errorBody}`);
+                    if (attempt === maxRetries - 1) break; // Try next model
+                }
+            } catch (error) {
+                console.error("Network or API error:", {
+                    model,
+                    error: error.message,
+                    attempt: attempt + 1,
+                    maxRetries
+                });
+                
+                if (attempt === maxRetries - 1) {
+                    lastError = error;
+                    break; // Try next model
+                }
+
+                const waitTime = baseDelay * Math.pow(2, attempt);
+                console.warn(`Retrying in ${waitTime/1000} seconds...`);
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+            }
+        }
+    }
+    
+    // If all attempts failed, throw the last error
+    if (lastError) {
+        throw lastError;
+    }
+    throw new Error("All available models failed to process the request. Please try again later.");
+};
+
+// Helper to list available models
+const listModels = async () => {
+    if (!hasApiKey) return null;
+    try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+        const res = await fetch(url, { method: 'GET' });
+        if (!res.ok) {
+            const text = await res.text();
+            console.error('ListModels API error:', res.status, text);
+            return null;
+        }
+        const json = await res.json();
+        return json.models || json;
+    } catch (e) {
+        console.error('Failed to list models:', e);
+        return null;
+    }
+};
+
+// --- Modal Component for SOLVE Guide ---
+const SolveGuideModal = ({ isOpen, onClose }) => {
+    if (!isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 backdrop-blur-sm p-4">
+            <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto transform transition-all duration-300 scale-100 p-6 md:p-8 font-sans">
+                <div className="flex justify-between items-center border-b pb-3 mb-4">
+                    <h3 className="text-2xl font-bold text-indigo-700">The 5-Step SOLVE Framework Guide</h3>
+                    <button onClick={onClose} className="text-gray-400 hover:text-gray-600 transition">
+                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                <div className="space-y-6">
+                    <p className="text-gray-600">The SOLVE framework is a structured approach to leading sales conversations, ensuring you handle objections and move toward a concrete next step.</p>
+                    {SOLVE_STEPS_DATA.map(step => (
+                        <div key={step.key} className="p-4 bg-indigo-50 rounded-lg border-l-4 border-indigo-500 shadow-sm">
+                            <div className="flex items-center space-x-2 mb-1">
+                                <div className="w-6 h-6 flex-shrink-0 flex items-center justify-center rounded-full bg-indigo-600 text-white font-bold text-sm">
+                                    {step.key}
+                                </div>
+                                <p className="font-bold text-lg text-gray-800">{step.label}</p>
+                            </div>
+                            <p className="text-sm text-gray-700">{step.long}</p>
+                        </div>
+                    ))}
+                </div>
+                <div className="mt-6 pt-4 border-t">
+                    <button onClick={onClose} className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg transition duration-200">
+                        Got It, Close Guide
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// --- Progress Panel (Right Side) ---
+const ProgressPanel = () => {
+    return (
+        <div className="w-full lg:w-80 bg-surface p-6 rounded-canva shadow-canva-lg overflow-y-auto font-sans h-full border border-divider">
+            <h2 className="text-xl font-bold text-primary mb-4 border-b border-divider pb-2">SOLVE Progress Tracker</h2>
+            <div className="space-y-4">
+                {SOLVE_STEPS_DATA.map(step => {
+                    const isComplete = solveStatus[step.key];
+                    return (
+                        <div 
+                            key={step.key} 
+                            className={`p-4 rounded-canva flex items-start space-x-3 transition-all duration-200 ${
+                                isComplete 
+                                    ? 'bg-primary/5 border-l-4 border-primary shadow-canva' 
+                                    : 'bg-surface-hover border-l-4 border-divider'
+                            }`}
+                        >
+                            <div className={`w-8 h-8 flex-shrink-0 flex items-center justify-center rounded-full font-bold text-white text-lg ${
+                                isComplete ? 'bg-primary' : 'bg-text-secondary'
+                            }`}>
+                                {step.key}
+                            </div>
+                            <div>
+                                <p className={`font-semibold text-sm ${isComplete ? 'text-primary' : 'text-text-primary'}`}>
+                                    {step.label}
+                                </p>
+                                <p className={`text-xs ${isComplete ? 'text-primary/80' : 'text-text-secondary'}`}>
+                                    {isComplete ? 'COMPLETED' : 'Awaiting action...'}
+                                </p>
+                            </div>
+                        </div>
+                    );
+                })}
+            </div>
+            <div className="mt-6 pt-4 border-t">
+                <button
+                    onClick={() => setIsConfiguring(true)}
+                    className="w-full py-2 mb-2 bg-surface-hover text-text-primary font-medium rounded-canva shadow-canva hover:bg-surface-pressed transition-colors duration-200"
+                    disabled={isLoading}
+                >
+                    Start New Scenario
+                </button>
+                <button
+                    onClick={() => processUserTurn("END_CALL")}
+                    className="w-full py-2 bg-danger hover:bg-danger-hover text-white font-medium rounded-canva shadow-canva transition-colors duration-200"
+                    disabled={isFinished || isLoading}
+                >
+                    {isFinished ? 'CALL FINISHED' : 'Finish & Get Feedback'}
+                </button>
+            </div>
+        </div>
+    );
+};
+
+// --- SOLVE Sales Practice Agent Component ---
+const App = () => {
+    const [messages, setMessages] = useState([]);
+    const [input, setInput] = useState('');
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState(null);
+    const [isFinished, setIsFinished] = useState(false);
+    const [solveStatus, setSolveStatus] = useState({ S: false, O: false, L: false, V: false, E: false });
+    const [isConfiguring, setIsConfiguring] = useState(true); 
+    const [isModalOpen, setIsModalOpen] = useState(false); 
+    const [prospectConfig, setProspectConfig] = useState({ 
+        persona: 'Skeptical, Budget-Conscious', 
+        industry: 'SEO Consulting (Filtering Low-Value Clients)' 
+    });
+    const [modelsList, setModelsList] = useState(null);
+    const messagesEndRef = useRef(null);
+
+    const scrollToBottom = () => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    };
+
+    useEffect(scrollToBottom, [messages]);
+
+    // --- Start Configuration Screen ---
+    const StartConfig = () => {
+        const personas = ['Skeptical, Budget-Conscious', 'Friendly, Time-Pressed', 'Overwhelmed, Needs Hand-Holding', 'Analyst, Data-Focused', 'Innovator, Excited but Distracted'];
+        const industries = ['SEO Consulting (Filtering Low-Value Clients)', 'B2B Software Sales (Streamlining Onboarding)', 'Real Estate Brokerage (Lead Qualification)', 'Financial Services (Compliance Automation)'];
+
+        const handleStart = () => {
+            // Set initial message
+            const { initialText, prospectName } = generateSystemRole(prospectConfig.persona, prospectConfig.industry);
+            setMessages([
+                { role: "coach", parts: [{ text: COACH_GUIDE_TEXT }] },
+                { role: "model", parts: [{ text: `${prospectName} (The Prospect):\n\n${initialText}` }] }
+            ]);
+            setIsConfiguring(false);
+            setIsFinished(false);
+            setSolveStatus({ S: false, O: false, L: false, V: false, E: false }); // Reset state
+        };
+
+        return (
+            <div className="flex flex-col items-center justify-center min-h-[80vh] p-4 bg-surface">
+                <div className="bg-surface p-8 md:p-10 rounded-canva shadow-canva-md max-w-lg w-full border border-divider">
+                    <h1 className="text-3xl md:text-4xl font-bold text-center text-primary mb-6">SOLVE Confidence Challenge</h1>
+                    <p className="text-center text-text-secondary mb-8 text-lg">Set up your sales scenario to practice handling objections and guiding the conversation to a win.</p>
+                    
+                    <div className="space-y-6">
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-1">Prospect Persona</label>
+                            <select
+                                value={prospectConfig.persona}
+                                onChange={(e) => setProspectConfig({...prospectConfig, persona: e.target.value})}
+                                className="w-full p-3 border border-divider rounded-canva shadow-canva hover:border-primary focus:border-primary focus:ring-2 focus:ring-primary/20 focus:outline-none transition-colors"
+                            >
+                                {personas.map(p => <option key={p} value={p}>{p}</option>)}
+                            </select>
+                        </div>
+
+                        <div>
+                            <label className="block text-sm font-medium text-text-secondary mb-1">Industry / Challenge Focus</label>
+                            <select
+                                value={prospectConfig.industry}
+                                onChange={(e) => setProspectConfig({...prospectConfig, industry: e.target.value})}
+                                className="w-full p-3 border border-divider rounded-canva shadow-canva hover:border-primary focus:border-primary focus:ring-2 focus:ring-primary/20 focus:outline-none transition-colors"
+                            >
+                                {industries.map(i => <option key={i} value={i}>{i}</option>)}
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div className="mt-8 space-y-3">
+                        <button
+                            onClick={handleStart}
+                            className="w-full py-3 bg-primary hover:bg-primary-dark text-white font-medium text-lg rounded-canva shadow-canva btn-transition"
+                        >
+                            Start Roleplay
+                        </button>
+                        <button
+                            onClick={() => setIsModalOpen(true)}
+                            className="w-full py-3 bg-surface border border-divider text-text-primary font-medium rounded-canva shadow-canva hover:bg-surface-hover btn-transition"
+                        >
+                            What is SOLVE?
+                        </button>
+                        <button
+                            onClick={async () => {
+                                setModelsList(null);
+                                const models = await listModels();
+                                setModelsList(models);
+                            }}
+                            className="w-full py-3 bg-surface-hover border border-primary/20 text-primary font-medium rounded-canva shadow-canva hover:bg-primary/5 btn-transition"
+                        >
+                            Debug: List Available Models
+                        </button>
+                    </div>
+                    {modelsList && (
+                        <div className="mt-4 p-3 bg-gray-50 rounded border border-gray-200">
+                            <h4 className="font-semibold mb-2">Available Models</h4>
+                            <ul className="text-sm text-gray-700 list-disc ml-5">
+                                {Array.isArray(modelsList) ? modelsList.map((m, idx) => (
+                                    <li key={m.name || idx}>{m.name || m.model || JSON.stringify(m)}</li>
+                                )) : <li>{JSON.stringify(modelsList)}</li>}
+                            </ul>
+                        </div>
+                    )}
+                </div>
+            </div>
+        );
+    };
+
+    // --- Main Render ---
+    if (isConfiguring) {
+        return (
+            <>
+                <StartConfig />
+                <SolveGuideModal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} />
+            </>
+        );
+    }
+
+    // Main Chat View
+    return (
+        <div className="flex flex-col lg:flex-row h-screen bg-surface-hover font-sans">
+            <SolveGuideModal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} />
+
+            {/* API key missing warning banner */}
+            {!hasApiKey && (
+                <div className="w-full bg-red-50 border-l-4 border-red-400 text-red-700 p-3 text-center">
+                    <strong>API key not configured.</strong> The AI features are disabled until you set <code>VITE_CLAUDE_API_KEY</code> in your <code>.env</code> and restart the dev server.
+                </div>
+            )}
+            
+            {/* Left Side: Chat Window */}
+            <div className="flex-grow flex flex-col p-4 bg-surface lg:h-full h-[60vh]">
+                <div className="flex-grow overflow-y-auto space-y-4 p-4 border border-divider rounded-canva bg-surface shadow-canva-md">
+                    {messages.map((message, index) => (
+                        <div key={index} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                            <div className={`max-w-3/4 p-4 rounded-canva shadow-canva ${
+                                message.role === 'user' 
+                                    ? 'bg-primary text-white rounded-br-none' 
+                                    : message.role === 'coach' ? 'bg-surface-hover text-text-primary border-l-4 border-primary rounded-bl-none'
+                                    : 'bg-surface-active text-text-primary rounded-bl-none'
+                            }`}>
+                                <p className="whitespace-pre-wrap text-[15px] leading-relaxed">{message.parts[0].text}</p>
+                            </div>
+                        </div>
+                    ))}
+                    {isLoading && (
+                        <div className="flex justify-start">
+                            <div className="max-w-3/4 p-4 rounded-canva shadow-canva bg-surface-hover text-text-secondary rounded-bl-none">
+                                <div className="flex items-center space-x-3">
+                                    <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-primary"></div>
+                                    <p>Prospect is thinking...</p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    <div ref={messagesEndRef} />
+                </div>
+
+                {/* Input Field */}
+                <form onSubmit={(e) => { e.preventDefault(); processUserTurn(); }} className="mt-4 flex space-x-3">
+                    <input
+                        type="text"
+                        value={input}
+                        onChange={(e) => setInput(e.target.value)}
+                        placeholder={isFinished ? "Call finished. Check feedback on the right." : "Your response to the prospect..."}
+                        className="flex-grow p-4 border border-divider rounded-canva shadow-canva hover:border-primary focus:border-primary focus:ring-2 focus:ring-primary/20 focus:outline-none transition-colors text-text-primary placeholder:text-text-secondary"
+                        disabled={isLoading || isFinished}
+                    />
+                    <button
+                        type="submit"
+                        className="px-8 py-4 bg-primary hover:bg-primary-dark text-white font-medium rounded-canva shadow-canva btn-transition disabled:opacity-50 disabled:cursor-not-allowed"
+                        disabled={isLoading || isFinished || input.trim().length === 0}
+                    >
+                        {isLoading ? 'Sending...' : 'Send'}
+                    </button>
+                </form>
+            </div>
+            
+            {/* Right Side: Progress Tracker / Feedback */}
+            <div className="lg:w-96 p-4 lg:h-full h-[40vh] flex-shrink-0">
+                <ProgressPanel />
+            </div>
+        </div>
+    );
+};
+
+export default App;

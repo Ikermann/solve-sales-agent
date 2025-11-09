@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <!-- A placeholder icon, common in Vite setups -->
+  <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+  <!-- Mandatory for responsiveness on mobile devices -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sales Agent App</title>
+
+  <!-- Load Tailwind CSS and configure theme -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary: '#7C3AED', // Canva purple
+            'primary-dark': '#6D28D9',
+            'primary-light': '#8B5CF6',
+            surface: '#ffffff',
+            'surface-hover': '#F7F8FB',
+            'surface-active': '#F1F2F6',
+            // Darken divider slightly for stronger edges
+            divider: '#D1D5DB',
+            'text-primary': '#0F172A',
+            'text-secondary': '#374151',
+          },
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+          boxShadow: {
+            // Stronger, darker shadows for more depth
+            'canva': '0 6px 12px -6px rgba(2,6,23,0.14), 0 2px 4px -2px rgba(2,6,23,0.08)',
+            'canva-md': '0 10px 20px -8px rgba(2,6,23,0.16), 0 4px 8px -4px rgba(2,6,23,0.10)',
+            'canva-lg': '0 20px 40px -12px rgba(2,6,23,0.20), 0 8px 16px -8px rgba(2,6,23,0.12)'
+          },
+          borderRadius: {
+            'canva': '0.5rem',
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+    
+    /* Base styles */
+    body { 
+      font-family: 'Inter', system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* Canva-style button transitions */
+    .btn-transition {
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    
+    /* Canva-style focus rings */
+    .focus-canva {
+      @apply focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 focus:ring-offset-white;
+    }
+  </style>
+</head>
+<body>
+    <!-- This is the critical mounting point. Your JavaScript application finds this ID and injects the UI here. -->
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+  <div id="root"></div>
+
+  <!-- CRITICAL: This script loads your application's main entry point (where the app logic starts). -->
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+</html>
